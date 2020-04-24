@@ -606,14 +606,16 @@ impl CondEval<'_> {
         }
     }
     fn additive(&mut self) -> Result<i128, ()> {
-        let v = self.unary()?;
-        Ok(if self.eat_op('+') {
-            v.checked_add(self.unary()?).ok_or(())?
-        } else if self.eat_op('-') {
-            v.checked_sub(self.unary()?).ok_or(())?
-        } else {
-            v
-        })
+        let mut v = self.unary()?;
+        loop {
+            v = if self.eat_op('+') {
+                v.checked_add(self.unary()?).ok_or(())?
+            } else if self.eat_op('-') {
+                v.checked_sub(self.unary()?).ok_or(())?
+            } else {
+                return Ok(v);
+            };
+        }
     }
     fn shift(&mut self) -> Result<i128, ()> {
         let v = self.additive()?;
