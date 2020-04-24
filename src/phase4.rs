@@ -123,20 +123,23 @@ impl<'a> Macro<'a> {
                 if tokens.eat(&Tok::Punct('#')) && tokens.eat(&Tok::Punct('#')) {
                     tokens.eat(&Tok::Whitespace);
 
+                    if let Some(Replacement::Verbatim(verbatim_tokens)) = replacements.last_mut() {
+                        if let Some((Tok::Whitespace, rest)) = verbatim_tokens.split_last() {
+                            if rest.is_empty() {
+                                replacements.pop();
+                            } else {
+                                *verbatim_tokens = rest;
+                            }
+                        }
+                    }
+
                     Some(match replacements.pop() {
-                        Some(Replacement::Verbatim(mut verbatim_tokens)) => {
-                            if let Some((Tok::Whitespace, rest)) = verbatim_tokens.split_last() {
-                                verbatim_tokens = rest;
+                        Some(Replacement::Verbatim(verbatim_tokens)) => {
+                            let (tok, verbatim_tokens) = verbatim_tokens.split_last().unwrap();
+                            if !verbatim_tokens.is_empty() {
+                                replacements.push(Replacement::Verbatim(verbatim_tokens));
                             }
-                            match verbatim_tokens.split_last() {
-                                Some((tok, verbatim_tokens)) => {
-                                    if !verbatim_tokens.is_empty() {
-                                        replacements.push(Replacement::Verbatim(verbatim_tokens));
-                                    }
-                                    vec![ConcatPart::Tok(tok)]
-                                }
-                                None => vec![],
-                            }
+                            vec![ConcatPart::Tok(tok)]
                         }
                         Some(Replacement::Param(mode, i)) => vec![ConcatPart::Param(mode, i)],
                         Some(Replacement::Concat(parts)) => parts,
