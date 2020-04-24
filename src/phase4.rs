@@ -395,12 +395,14 @@ fn expand_macros<'d>(
     // FIXME(eddyb) use `Cow` to optimize the case when no tokens are expanded.
     let mut output_tokens = vec![];
 
+    let mut any_expansions = false;
     let mut tokens = tokens.iter();
     while let Some(tok) = tokens.next() {
         if let Tok::Ident(name) = tok {
             if let Some((&name, m)) = defines.get_key_value(&name[..]) {
                 if let Some(expanded_tokens) = m.expand(name, defines, in_progress, &mut tokens) {
                     output_tokens.extend(expanded_tokens);
+                    any_expansions = true;
                     continue;
                 }
             }
@@ -409,8 +411,14 @@ fn expand_macros<'d>(
         output_tokens.push(tok.clone());
     }
 
-    // FIXME(eddyb) repeat expansion until fixpoint (could take advantage of `Cow`).
-    output_tokens
+    // FIXME(eddyb) provide a way to control this, and/or optimize it.
+    let try_fixpoint = false;
+    if any_expansions && try_fixpoint {
+        // HACK(eddyb) this achieves fixpoint but is much more inefficient than it needs to be.
+        expand_macros(&output_tokens, defines, in_progress)
+    } else {
+        output_tokens
+    }
 }
 
 fn expand_macros_in_cond(
