@@ -1,0 +1,13 @@
+[package]
+name = "cprep"
+version = "0.0.1"
+authors = ["Eduard-Mihai Burtescu <edy.burt@gmail.com>"]
+edition = "2018"
+repository = "https://github.com/eddyb/cprep"
+license = "MIT/Apache-2.0"
+description = "C/C++ preprocessor."
+
+[dependencies]
+walkdir = "2.3.1"
+indexmap = "1.3.2"
+elsa = "1.3.2"
