@@ -606,7 +606,12 @@ impl<'a> CondEval<'a> {
 
                     SpecialCondMacro::HasFeature => match self.eat_ident().ok_or(())? {
                         // FIXME(eddyb) provide a way to customize the set of features.
-                        _feature => false,
+                        feature => {
+                            feature.starts_with("c_")
+                                || feature.starts_with("cxx_")
+                                || feature.starts_with("attribute_")
+                                || feature.starts_with("__") && !feature.ends_with("__")
+                        }
                     },
 
                     SpecialCondMacro::IsIdentifier => match self.eat_ident().ok_or(())? {
