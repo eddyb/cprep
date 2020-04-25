@@ -422,7 +422,9 @@ fn expand_macros<'d>(
 }
 
 enum SpecialCondMacro {
+    HasAttribute,
     HasBuiltin,
+    HasCppAttribute,
     HasFeature,
     HasInclude,
     HasIncludeNext,
@@ -432,7 +434,9 @@ enum SpecialCondMacro {
 impl SpecialCondMacro {
     fn from_ident(name: &str) -> Option<Self> {
         Some(match name {
+            "__has_attribute" => SpecialCondMacro::HasAttribute,
             "__has_builtin" => SpecialCondMacro::HasBuiltin,
+            "__has_cpp_attribute" => SpecialCondMacro::HasCppAttribute,
             "__has_feature" => SpecialCondMacro::HasFeature,
             "__has_include" => SpecialCondMacro::HasInclude,
             "__has_include_next" => SpecialCondMacro::HasIncludeNext,
@@ -577,10 +581,28 @@ impl<'a> CondEval<'a> {
                         return Err(())
                     }
 
+                    SpecialCondMacro::HasAttribute => match self.eat_ident().ok_or(())? {
+                        // FIXME(eddyb) provide a way to customize the set of GNU attributes.
+                        _attr => true,
+                    },
+
                     SpecialCondMacro::HasBuiltin => match self.eat_ident().ok_or(())? {
                         // FIXME(eddyb) provide a way to customize the set of builtins.
                         builtin => builtin.starts_with("__"),
                     },
+
+                    SpecialCondMacro::HasCppAttribute => {
+                        let attr = self.eat_ident().ok_or(())?;
+                        let (scope, attr) = if self.eat_op2(':', ':') {
+                            (Some(attr), self.eat_ident().ok_or(())?)
+                        } else {
+                            (None, attr)
+                        };
+                        match (scope, attr) {
+                            // FIXME(eddyb) provide a way to customize the set of C++ attributes.
+                            (_scope, _attr) => true,
+                        }
+                    }
 
                     SpecialCondMacro::HasFeature => match self.eat_ident().ok_or(())? {
                         // FIXME(eddyb) provide a way to customize the set of features.
