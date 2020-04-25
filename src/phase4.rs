@@ -421,6 +421,27 @@ fn expand_macros<'d>(
     }
 }
 
+enum SpecialCondMacro {
+    HasBuiltin,
+    HasFeature,
+    HasInclude,
+    HasIncludeNext,
+    IsIdentifier,
+}
+
+impl SpecialCondMacro {
+    fn from_ident(name: &str) -> Option<Self> {
+        Some(match name {
+            "__has_builtin" => SpecialCondMacro::HasBuiltin,
+            "__has_feature" => SpecialCondMacro::HasFeature,
+            "__has_include" => SpecialCondMacro::HasInclude,
+            "__has_include_next" => SpecialCondMacro::HasIncludeNext,
+            "__is_identifier" => SpecialCondMacro::IsIdentifier,
+            _ => return None,
+        })
+    }
+}
+
 fn expand_macros_in_cond(
     tokens: &[Tok],
     enclosing_src_file: &SourceFile,
@@ -434,10 +455,6 @@ fn expand_macros_in_cond(
     let mut tokens = tokens.iter();
     while let Some(tok) = tokens.next() {
         if let Tok::Ident(name) = tok {
-            if name == "true" {
-                output_tokens.push(Tok::Literal(1.to_string()));
-            }
-
             if name == "defined" {
                 if let Some(arg_name) = tokens.try_eat(|tokens| {
                     tokens.eat(&Tok::Whitespace);
@@ -456,18 +473,17 @@ fn expand_macros_in_cond(
                         _ => None,
                     }
                 }) {
-                    let is_defined = arg_name == "__has_include"
-                        || arg_name == "__has_include_next"
-                        || arg_name == "__has_builtin"
-                        || arg_name == "__has_feature"
-                        || arg_name == "__is_identifier"
+                    let is_defined = SpecialCondMacro::from_ident(arg_name).is_some()
                         || defines.contains_key(&arg_name[..]);
                     output_tokens.push(Tok::Literal((is_defined as u8).to_string()));
                     continue;
                 }
             }
 
-            if name == "__has_include" || name == "__has_include_next" {
+            if let Some(special @ SpecialCondMacro::HasInclude)
+            | Some(special @ SpecialCondMacro::HasIncludeNext) =
+                SpecialCondMacro::from_ident(&name)
+            {
                 if let Some((style, header_name)) = tokens.try_eat(|tokens| {
                     tokens.eat(&Tok::Whitespace);
                     if tokens.eat(&Tok::Punct('(')) {
@@ -480,7 +496,7 @@ fn expand_macros_in_cond(
                     }
                     None
                 }) {
-                    let start_after = if name == "__has_include_next" {
+                    let start_after = if let SpecialCondMacro::HasIncludeNext = special {
                         enclosing_header
                     } else {
                         None
@@ -488,37 +504,6 @@ fn expand_macros_in_cond(
                     let has_include =
                         headers.has_include(style, enclosing_src_file, &header_name, start_after);
                     output_tokens.push(Tok::Literal((has_include as u8).to_string()));
-                    continue;
-                }
-            }
-
-            if name == "__has_builtin" || name == "__has_feature" || name == "__is_identifier" {
-                if let Some(arg_name) = tokens.try_eat(|tokens| {
-                    tokens.eat(&Tok::Whitespace);
-                    if tokens.eat(&Tok::Punct('(')) {
-                        tokens.eat(&Tok::Whitespace);
-                        if let Tok::Ident(name) = tokens.next()? {
-                            tokens.eat(&Tok::Whitespace);
-                            if tokens.eat(&Tok::Punct(')')) {
-                                return Some(name);
-                            }
-                        }
-                    }
-                    None
-                }) {
-                    let result = match &name[..] {
-                        // FIXME(eddyb) provide a way to customize the set of builtins.
-                        "__has_builtin" => arg_name.starts_with("__"),
-
-                        // FIXME(eddyb) provide a way to customize the set of features.
-                        "__has_feature" => false,
-
-                        // FIXME(eddyb) provide a way to customize the set of reserved names.
-                        "__is_identifier" => !arg_name.starts_with("__"),
-
-                        _ => unreachable!(),
-                    };
-                    output_tokens.push(Tok::Literal((result as u8).to_string()));
                     continue;
                 }
             }
@@ -543,7 +528,7 @@ struct CondEval<'a> {
     tokens: std::slice::Iter<'a, Tok>,
 }
 
-impl CondEval<'_> {
+impl<'a> CondEval<'a> {
     fn eat_op(&mut self, op: char) -> bool {
         self.tokens.eat(&Tok::Whitespace);
         self.tokens.eat(&Tok::Punct(op))
@@ -552,6 +537,20 @@ impl CondEval<'_> {
         self.tokens.eat(&Tok::Whitespace);
         self.tokens
             .eat_seq(iter::once(&Tok::Punct(op1)).chain(iter::once(&Tok::Punct(op2))))
+    }
+    fn eat_ident(&mut self) -> Option<&'a str> {
+        self.tokens.eat(&Tok::Whitespace);
+        self.tokens.try_eat(|tokens| match tokens.next()? {
+            Tok::Ident(s) => Some(&s[..]),
+            _ => None,
+        })
+    }
+    fn eat_lit(&mut self) -> Option<&'a str> {
+        self.tokens.eat(&Tok::Whitespace);
+        self.tokens.try_eat(|tokens| match tokens.next()? {
+            Tok::Literal(s) => Some(&s[..]),
+            _ => None,
+        })
     }
 
     fn primary(&mut self) -> Result<i128, ()> {
@@ -562,40 +561,69 @@ impl CondEval<'_> {
             } else {
                 Err(())
             }
+        } else if let Some(name) = self.eat_ident() {
+            // Identifiers are supposed to be replaced with `0`,
+            // except `true` and the several condition-only macros.
+            Ok(if name == "true" {
+                1
+            } else if let Some(special) = SpecialCondMacro::from_ident(name) {
+                if !self.eat_op('(') {
+                    return Err(());
+                }
+
+                let value = match special {
+                    // FIXME(eddyb) handle these more uniformly with the rest.
+                    SpecialCondMacro::HasInclude | SpecialCondMacro::HasIncludeNext => {
+                        return Err(())
+                    }
+
+                    SpecialCondMacro::HasBuiltin => match self.eat_ident().ok_or(())? {
+                        // FIXME(eddyb) provide a way to customize the set of builtins.
+                        builtin => builtin.starts_with("__"),
+                    },
+
+                    SpecialCondMacro::HasFeature => match self.eat_ident().ok_or(())? {
+                        // FIXME(eddyb) provide a way to customize the set of features.
+                        _feature => false,
+                    },
+
+                    SpecialCondMacro::IsIdentifier => match self.eat_ident().ok_or(())? {
+                        // FIXME(eddyb) provide a way to customize the set of reserved names.
+                        ident => !ident.starts_with("__"),
+                    },
+                };
+
+                if !self.eat_op(')') {
+                    return Err(());
+                }
+
+                value as i128
+            } else {
+                0
+            })
+        } else if let Some(mut lit) = self.eat_lit() {
+            // NOTE(eddyb) a prefix of `0` means a base other than 10.
+            if !lit.starts_with(|c| matches!(c, '1'..='9')) {
+                // HACK(eddyb) still need to support `0` itself
+                let is_zero =
+                    lit.starts_with("0") && !lit[1..].starts_with(|c| matches!(c, '0'..='9'));
+                if !is_zero {
+                    return Err(());
+                }
+            }
+
+            // TODO strip any suffixes and ' separators
+
+            if lit.ends_with(&['l', 'L'][..]) {
+                lit = &lit[..lit.len() - 1];
+            }
+            if lit.ends_with(&['u', 'U'][..]) {
+                lit = &lit[..lit.len() - 1];
+            }
+
+            lit.parse::<i128>().map_err(|_| {})
         } else {
-            self.tokens.eat(&Tok::Whitespace);
-            self.tokens
-                .try_eat(|tokens| {
-                    let mut lit = match tokens.next()? {
-                        // Identifiers are supposed to be replaced with `0`.
-                        Tok::Ident(_) => return Some(0),
-
-                        Tok::Literal(lit) => &lit[..],
-                        _ => return None,
-                    };
-
-                    // NOTE(eddyb) a prefix of `0` means a base other than 10.
-                    if !lit.starts_with(|c| matches!(c, '1'..='9')) {
-                        // HACK(eddyb) still need to support `0` itself
-                        let is_zero = lit.starts_with("0")
-                            && !lit[1..].starts_with(|c| matches!(c, '0'..='9'));
-                        if !is_zero {
-                            return None;
-                        }
-                    }
-
-                    // TODO strip any suffixes and ' separators
-
-                    if lit.ends_with(&['l', 'L'][..]) {
-                        lit = &lit[..lit.len() - 1];
-                    }
-                    if lit.ends_with(&['u', 'U'][..]) {
-                        lit = &lit[..lit.len() - 1];
-                    }
-
-                    lit.parse::<i128>().ok()
-                })
-                .ok_or(())
+            Err(())
         }
     }
     fn unary(&mut self) -> Result<i128, ()> {
