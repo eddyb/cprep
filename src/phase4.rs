@@ -48,6 +48,11 @@ enum ConcatPart<'a> {
 }
 
 #[derive(Copy, Clone)]
+enum BuiltinMacro {
+    File,
+}
+
+#[derive(Copy, Clone)]
 enum SpecialCondMacro {
     HasAttribute,
     HasBuiltin,
@@ -60,6 +65,7 @@ enum SpecialCondMacro {
 
 #[derive(Clone)]
 enum MacroBody<'a> {
+    Builtin(BuiltinMacro),
     CondOnly(SpecialCondMacro),
     Regular(Vec<Replacement<'a>>),
 }
@@ -219,26 +225,39 @@ pub struct Phase4<'a> {
 
 impl<'a> Phase4<'a> {
     pub fn new(src: &'a SourceFile, headers: &'a Headers) -> Self {
-        let defines = [
-            ("__has_attribute", SpecialCondMacro::HasAttribute),
-            ("__has_builtin", SpecialCondMacro::HasBuiltin),
-            ("__has_cpp_attribute", SpecialCondMacro::HasCppAttribute),
-            ("__has_feature", SpecialCondMacro::HasFeature),
-            ("__has_include", SpecialCondMacro::HasInclude),
-            ("__has_include_next", SpecialCondMacro::HasIncludeNext),
-            ("__is_identifier", SpecialCondMacro::IsIdentifier),
-        ]
-        .iter()
-        .map(|&(name, special)| {
-            (
-                name,
-                Macro {
-                    params: Some((1, false)),
-                    body: MacroBody::CondOnly(special),
-                },
+        let defines = [("__FILE__", BuiltinMacro::File)]
+            .iter()
+            .map(|&(name, builtin)| {
+                (
+                    name,
+                    Macro {
+                        params: None,
+                        body: MacroBody::Builtin(builtin),
+                    },
+                )
+            })
+            .chain(
+                [
+                    ("__has_attribute", SpecialCondMacro::HasAttribute),
+                    ("__has_builtin", SpecialCondMacro::HasBuiltin),
+                    ("__has_cpp_attribute", SpecialCondMacro::HasCppAttribute),
+                    ("__has_feature", SpecialCondMacro::HasFeature),
+                    ("__has_include", SpecialCondMacro::HasInclude),
+                    ("__has_include_next", SpecialCondMacro::HasIncludeNext),
+                    ("__is_identifier", SpecialCondMacro::IsIdentifier),
+                ]
+                .iter()
+                .map(|&(name, special)| {
+                    (
+                        name,
+                        Macro {
+                            params: Some((1, false)),
+                            body: MacroBody::CondOnly(special),
+                        },
+                    )
+                }),
             )
-        })
-        .collect();
+            .collect();
 
         Phase4 {
             enclosing_src_file: src,
@@ -361,6 +380,15 @@ impl Macro<'_> {
         };
 
         let replacements = match &self.body {
+            MacroBody::Builtin(builtin) => match builtin {
+                BuiltinMacro::File => {
+                    let file_path = phase4.enclosing_src_file.path.display().to_string();
+
+                    // FIXME(eddyb) use custom escaping instead of Rust `{:?}`.
+                    return Some(vec![Tok::Literal(format!("{:?}", file_path))]);
+                }
+            },
+
             MacroBody::CondOnly(special) => {
                 let value = match special {
                     // FIXME(eddyb) handle these more uniformly with the rest.
@@ -531,8 +559,8 @@ impl<'a> Phase4<'a> {
             if let Tok::Ident(name) = tok {
                 if let Some((&name, m)) = self.defines.get_key_value(&name[..]) {
                     let allowed = match m.body {
+                        MacroBody::Builtin(_) | MacroBody::Regular(_) => true,
                         MacroBody::CondOnly(_) => false,
-                        MacroBody::Regular(_) => true,
                     };
                     if allowed {
                         if let Some(expanded_tokens) =
