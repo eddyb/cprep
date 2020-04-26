@@ -222,7 +222,7 @@ impl<'a> Phase4<'a> {
 
 impl Macro<'_> {
     // FIXME(eddyb) consider changing code like this to take a `&mut Vec<Tok>`
-    fn expand<'d>(
+    fn try_expand<'d>(
         &self,
         name: &'d str,
         phase4: &Phase4<'d>,
@@ -427,7 +427,9 @@ impl<'a> Phase4<'a> {
         while let Some(tok) = tokens.next() {
             if let Tok::Ident(name) = tok {
                 if let Some((&name, m)) = self.defines.get_key_value(&name[..]) {
-                    if let Some(expanded_tokens) = m.expand(name, self, in_progress, &mut tokens) {
+                    if let Some(expanded_tokens) =
+                        m.try_expand(name, self, in_progress, &mut tokens)
+                    {
                         output_tokens.extend(expanded_tokens);
                         any_expansions = true;
                         continue;
@@ -541,7 +543,7 @@ impl Phase4<'_> {
 
                 if let Some((&name, m)) = self.defines.get_key_value(&name[..]) {
                     if let Some(expanded_tokens) =
-                        m.expand(name, self, &mut HashSet::new(), &mut tokens)
+                        m.try_expand(name, self, &mut HashSet::new(), &mut tokens)
                     {
                         output_tokens.extend(expanded_tokens);
                         continue;
