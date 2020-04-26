@@ -47,10 +47,27 @@ enum ConcatPart<'a> {
     Param(ParamMode, usize),
 }
 
+#[derive(Copy, Clone)]
+enum SpecialCondMacro {
+    HasAttribute,
+    HasBuiltin,
+    HasCppAttribute,
+    HasFeature,
+    HasInclude,
+    HasIncludeNext,
+    IsIdentifier,
+}
+
+#[derive(Clone)]
+enum MacroBody<'a> {
+    CondOnly(SpecialCondMacro),
+    Regular(Vec<Replacement<'a>>),
+}
+
 #[derive(Clone)]
 struct Macro<'a> {
     params: Option<(usize, bool)>,
-    replacements: Vec<Replacement<'a>>,
+    body: MacroBody<'a>,
 }
 
 impl<'a> Macro<'a> {
@@ -188,7 +205,7 @@ impl<'a> Macro<'a> {
 
         Macro {
             params: params.map(|(params, is_variadic)| (params.len(), is_variadic)),
-            replacements,
+            body: MacroBody::Regular(replacements),
         }
     }
 }
@@ -202,11 +219,32 @@ pub struct Phase4<'a> {
 
 impl<'a> Phase4<'a> {
     pub fn new(src: &'a SourceFile, headers: &'a Headers) -> Self {
+        let defines = [
+            ("__has_attribute", SpecialCondMacro::HasAttribute),
+            ("__has_builtin", SpecialCondMacro::HasBuiltin),
+            ("__has_cpp_attribute", SpecialCondMacro::HasCppAttribute),
+            ("__has_feature", SpecialCondMacro::HasFeature),
+            ("__has_include", SpecialCondMacro::HasInclude),
+            ("__has_include_next", SpecialCondMacro::HasIncludeNext),
+            ("__is_identifier", SpecialCondMacro::IsIdentifier),
+        ]
+        .iter()
+        .map(|&(name, special)| {
+            (
+                name,
+                Macro {
+                    params: Some((1, false)),
+                    body: MacroBody::CondOnly(special),
+                },
+            )
+        })
+        .collect();
+
         Phase4 {
             enclosing_src_file: src,
             enclosing_header: None,
             headers,
-            defines: HashMap::new(),
+            defines,
         }
     }
 
@@ -322,14 +360,79 @@ impl Macro<'_> {
             Tok::Literal(format!("{:?}", stringified))
         };
 
+        let replacements = match &self.body {
+            MacroBody::CondOnly(special) => {
+                let value = match special {
+                    // FIXME(eddyb) handle these more uniformly with the rest.
+                    SpecialCondMacro::HasInclude | SpecialCondMacro::HasIncludeNext => {
+                        return None;
+                    }
+
+                    SpecialCondMacro::HasAttribute => match args[0] {
+                        // FIXME(eddyb) provide a way to customize the set of GNU attributes.
+                        [Tok::Ident(_attr)] => true,
+
+                        _ => return None,
+                    },
+
+                    SpecialCondMacro::HasBuiltin => match args[0] {
+                        // FIXME(eddyb) provide a way to customize the set of builtins.
+                        [Tok::Ident(builtin)] => builtin.starts_with("__"),
+
+                        _ => return None,
+                    },
+
+                    SpecialCondMacro::HasCppAttribute => {
+                        let (scope, attr) = match args[0] {
+                            [Tok::Ident(attr)] => (None, attr),
+
+                            // FIXME(eddyb) DRY this.
+                            [Tok::Ident(scope), Tok::Punct(':'), Tok::Punct(':'), Tok::Ident(attr)]
+                            | [Tok::Ident(scope), Tok::Whitespace, Tok::Punct(':'), Tok::Punct(':'), Tok::Ident(attr)]
+                            | [Tok::Ident(scope), Tok::Punct(':'), Tok::Punct(':'), Tok::Whitespace, Tok::Ident(attr)]
+                            | [Tok::Ident(scope), Tok::Whitespace, Tok::Punct(':'), Tok::Punct(':'), Tok::Whitespace, Tok::Ident(attr)] => {
+                                (Some(scope), attr)
+                            }
+
+                            _ => return None,
+                        };
+                        match (scope, attr) {
+                            // FIXME(eddyb) provide a way to customize the set of C++ attributes.
+                            (_scope, _attr) => true,
+                        }
+                    }
+
+                    SpecialCondMacro::HasFeature => match args[0] {
+                        // FIXME(eddyb) provide a way to customize the set of features.
+                        [Tok::Ident(feature)] => {
+                            feature.starts_with("c_")
+                                || feature.starts_with("cxx_")
+                                || feature.starts_with("attribute_")
+                                || feature.starts_with("__") && !feature.ends_with("__")
+                        }
+
+                        _ => return None,
+                    },
+
+                    SpecialCondMacro::IsIdentifier => match args[0] {
+                        // FIXME(eddyb) provide a way to customize the set of reserved names.
+                        [Tok::Ident(ident)] => !ident.starts_with("__"),
+
+                        _ => return None,
+                    },
+                };
+                return Some(vec![Tok::Literal((value as u8).to_string())]);
+            }
+
+            MacroBody::Regular(replacements) => &replacements[..],
+        };
+
         let mut substituted_tokens = vec![];
-        let substituted_tokens = if let [Replacement::Verbatim(verbatim_tokens)] =
-            &self.replacements[..]
-        {
+        let substituted_tokens = if let [Replacement::Verbatim(verbatim_tokens)] = replacements {
             // HACK(eddyb) this optimizes the case when no tokens are substituted.
             verbatim_tokens
         } else {
-            for replacement in &self.replacements {
+            for replacement in replacements {
                 match replacement {
                     Replacement::Verbatim(verbatim_tokens) => {
                         substituted_tokens.extend_from_slice(verbatim_tokens);
@@ -427,12 +530,18 @@ impl<'a> Phase4<'a> {
         while let Some(tok) = tokens.next() {
             if let Tok::Ident(name) = tok {
                 if let Some((&name, m)) = self.defines.get_key_value(&name[..]) {
-                    if let Some(expanded_tokens) =
-                        m.try_expand(name, self, in_progress, &mut tokens)
-                    {
-                        output_tokens.extend(expanded_tokens);
-                        any_expansions = true;
-                        continue;
+                    let allowed = match m.body {
+                        MacroBody::CondOnly(_) => false,
+                        MacroBody::Regular(_) => true,
+                    };
+                    if allowed {
+                        if let Some(expanded_tokens) =
+                            m.try_expand(name, self, in_progress, &mut tokens)
+                        {
+                            output_tokens.extend(expanded_tokens);
+                            any_expansions = true;
+                            continue;
+                        }
                     }
                 }
             }
@@ -448,31 +557,6 @@ impl<'a> Phase4<'a> {
         } else {
             output_tokens
         }
-    }
-}
-
-enum SpecialCondMacro {
-    HasAttribute,
-    HasBuiltin,
-    HasCppAttribute,
-    HasFeature,
-    HasInclude,
-    HasIncludeNext,
-    IsIdentifier,
-}
-
-impl SpecialCondMacro {
-    fn from_ident(name: &str) -> Option<Self> {
-        Some(match name {
-            "__has_attribute" => SpecialCondMacro::HasAttribute,
-            "__has_builtin" => SpecialCondMacro::HasBuiltin,
-            "__has_cpp_attribute" => SpecialCondMacro::HasCppAttribute,
-            "__has_feature" => SpecialCondMacro::HasFeature,
-            "__has_include" => SpecialCondMacro::HasInclude,
-            "__has_include_next" => SpecialCondMacro::HasIncludeNext,
-            "__is_identifier" => SpecialCondMacro::IsIdentifier,
-            _ => return None,
-        })
     }
 }
 
@@ -502,46 +586,44 @@ impl Phase4<'_> {
                             _ => None,
                         }
                     }) {
-                        let is_defined = SpecialCondMacro::from_ident(arg_name).is_some()
-                            || self.defines.contains_key(&arg_name[..]);
+                        let is_defined = self.defines.contains_key(&arg_name[..]);
                         output_tokens.push(Tok::Literal((is_defined as u8).to_string()));
                         continue;
                     }
                 }
 
-                if let Some(special @ SpecialCondMacro::HasInclude)
-                | Some(special @ SpecialCondMacro::HasIncludeNext) =
-                    SpecialCondMacro::from_ident(&name)
-                {
-                    if let Some((style, header_name)) = tokens.try_eat(|tokens| {
-                        tokens.eat(&Tok::Whitespace);
-                        if tokens.eat(&Tok::Punct('(')) {
-                            tokens.eat(&Tok::Whitespace);
-                            let header_name = parse_header_name(tokens)?;
-                            tokens.eat(&Tok::Whitespace);
-                            if tokens.eat(&Tok::Punct(')')) {
-                                return Some(header_name);
-                            }
-                        }
-                        None
-                    }) {
-                        let start_after = if let SpecialCondMacro::HasIncludeNext = special {
-                            self.enclosing_header
-                        } else {
-                            None
-                        };
-                        let has_include = self.headers.has_include(
-                            style,
-                            self.enclosing_src_file,
-                            &header_name,
-                            start_after,
-                        );
-                        output_tokens.push(Tok::Literal((has_include as u8).to_string()));
-                        continue;
-                    }
-                }
-
                 if let Some((&name, m)) = self.defines.get_key_value(&name[..]) {
+                    if let MacroBody::CondOnly(special @ SpecialCondMacro::HasInclude)
+                    | MacroBody::CondOnly(special @ SpecialCondMacro::HasIncludeNext) = m.body
+                    {
+                        if let Some((style, header_name)) = tokens.try_eat(|tokens| {
+                            tokens.eat(&Tok::Whitespace);
+                            if tokens.eat(&Tok::Punct('(')) {
+                                tokens.eat(&Tok::Whitespace);
+                                let header_name = parse_header_name(tokens)?;
+                                tokens.eat(&Tok::Whitespace);
+                                if tokens.eat(&Tok::Punct(')')) {
+                                    return Some(header_name);
+                                }
+                            }
+                            None
+                        }) {
+                            let start_after = if let SpecialCondMacro::HasIncludeNext = special {
+                                self.enclosing_header
+                            } else {
+                                None
+                            };
+                            let has_include = self.headers.has_include(
+                                style,
+                                self.enclosing_src_file,
+                                &header_name,
+                                start_after,
+                            );
+                            output_tokens.push(Tok::Literal((has_include as u8).to_string()));
+                            continue;
+                        }
+                    }
+
                     if let Some(expanded_tokens) =
                         m.try_expand(name, self, &mut HashSet::new(), &mut tokens)
                     {
@@ -596,68 +678,8 @@ impl<'a> CondEval<'a> {
                 Err(())
             }
         } else if let Some(name) = self.eat_ident() {
-            // Identifiers are supposed to be replaced with `0`,
-            // except `true` and the several condition-only macros.
-            Ok(if name == "true" {
-                1
-            } else if let Some(special) = SpecialCondMacro::from_ident(name) {
-                if !self.eat_op('(') {
-                    return Err(());
-                }
-
-                let value = match special {
-                    // FIXME(eddyb) handle these more uniformly with the rest.
-                    SpecialCondMacro::HasInclude | SpecialCondMacro::HasIncludeNext => {
-                        return Err(())
-                    }
-
-                    SpecialCondMacro::HasAttribute => match self.eat_ident().ok_or(())? {
-                        // FIXME(eddyb) provide a way to customize the set of GNU attributes.
-                        _attr => true,
-                    },
-
-                    SpecialCondMacro::HasBuiltin => match self.eat_ident().ok_or(())? {
-                        // FIXME(eddyb) provide a way to customize the set of builtins.
-                        builtin => builtin.starts_with("__"),
-                    },
-
-                    SpecialCondMacro::HasCppAttribute => {
-                        let attr = self.eat_ident().ok_or(())?;
-                        let (scope, attr) = if self.eat_op2(':', ':') {
-                            (Some(attr), self.eat_ident().ok_or(())?)
-                        } else {
-                            (None, attr)
-                        };
-                        match (scope, attr) {
-                            // FIXME(eddyb) provide a way to customize the set of C++ attributes.
-                            (_scope, _attr) => true,
-                        }
-                    }
-
-                    SpecialCondMacro::HasFeature => match self.eat_ident().ok_or(())? {
-                        // FIXME(eddyb) provide a way to customize the set of features.
-                        feature => {
-                            feature.starts_with("c_")
-                                || feature.starts_with("cxx_")
-                                || feature.starts_with("attribute_")
-                                || feature.starts_with("__") && !feature.ends_with("__")
-                        }
-                    },
-
-                    SpecialCondMacro::IsIdentifier => match self.eat_ident().ok_or(())? {
-                        // FIXME(eddyb) provide a way to customize the set of reserved names.
-                        ident => !ident.starts_with("__"),
-                    },
-                };
-
-                if !self.eat_op(')') {
-                    return Err(());
-                }
-
-                value as i128
-            } else {
-                0
-            })
+            // Identifiers are supposed to be replaced with `0`, except `true`.
+            Ok(if name == "true" { 1 } else { 0 })
         } else if let Some(mut lit) = self.eat_lit() {
             // NOTE(eddyb) a prefix of `0` means a base other than 10.
             if !lit.starts_with(|c| matches!(c, '1'..='9')) {
