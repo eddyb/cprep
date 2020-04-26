@@ -318,101 +318,89 @@ impl Macro<'_> {
         name: &str,
         phase4: &Phase4<'_>,
         outer: &OuterExpansion<'_>,
-        input_tokens: &mut std::slice::Iter<'_, Tok>,
+        args_tokens: &mut std::slice::Iter<'_, Tok>,
     ) -> Option<Vec<Tok>> {
         if outer.is_expanding(name) {
             return None;
         }
 
-        // HACK(eddyb) return early to avoid parsing tokens below.
-        // FIXME(eddyb) move this check down and allow `return None`
-        // anywhere in this function without breaking anything.
-        match self.body {
-            MacroBody::CondOnly(_) => {
-                if !outer.originates_from_cond() {
-                    return None;
+        let args = if let Some((param_count, is_variadic)) = self.params {
+            let expected_args = param_count + (is_variadic as usize);
+
+            let tokens = args_tokens;
+
+            while tokens.eat(&Tok::Whitespace) || tokens.eat(&Tok::Newline) {}
+            if !tokens.eat(&Tok::Punct('(')) {
+                return None;
+            }
+
+            let mut args = vec![];
+
+            loop {
+                while tokens.eat(&Tok::Whitespace) || tokens.eat(&Tok::Newline) {}
+
+                if expected_args == 0 {
+                    if tokens.eat(&Tok::Punct(')')) {
+                        break;
+                    } else {
+                        return None;
+                    }
+                }
+
+                let arg_start_tokens = tokens.as_slice();
+                // HACK(eddyb) find a nicer way to write this loop.
+                let mut closing_paren = false;
+                loop {
+                    match tokens.next()? {
+                        Tok::Punct('(') => {
+                            let mut depth = 1;
+                            while depth > 0 {
+                                match tokens.next()? {
+                                    Tok::Punct('(') => depth += 1,
+                                    Tok::Punct(')') => depth -= 1,
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Tok::Punct(')') => {
+                            closing_paren = true;
+                            break;
+                        }
+
+                        Tok::Punct(',') if is_variadic && args.len() == param_count => {}
+                        Tok::Punct(',') => break,
+
+                        _ => {}
+                    }
+                }
+
+                // The extra token not included in the argument is `,` or `)`.
+                let non_arg_tokens = tokens.as_slice().len() + 1;
+                let mut arg_tokens = &arg_start_tokens[..arg_start_tokens.len() - non_arg_tokens];
+                while let Some((Tok::Whitespace, rest)) | Some((Tok::Newline, rest)) =
+                    arg_tokens.split_last()
+                {
+                    arg_tokens = rest;
+                }
+                args.push(arg_tokens);
+
+                if closing_paren {
+                    if is_variadic && args.len() == param_count {
+                        args.push(&[]);
+                    }
+                    if args.len() == expected_args {
+                        break;
+                    } else {
+                        return None;
+                    };
+                } else {
+                    if args.len() == expected_args {
+                        return None;
+                    }
                 }
             }
 
-            MacroBody::Builtin(_) | MacroBody::Regular(_) => {}
-        }
-
-        let args = if let Some((param_count, is_variadic)) = self.params {
-            let expected_args = param_count + (is_variadic as usize);
-            input_tokens.try_eat(|tokens| {
-                while tokens.eat(&Tok::Whitespace) || tokens.eat(&Tok::Newline) {}
-                if !tokens.eat(&Tok::Punct('(')) {
-                    return None;
-                }
-
-                let mut args = vec![];
-
-                if expected_args == 0 {
-                    while tokens.eat(&Tok::Whitespace) || tokens.eat(&Tok::Newline) {}
-                    return if tokens.eat(&Tok::Punct(')')) {
-                        Some(args)
-                    } else {
-                        None
-                    };
-                }
-
-                loop {
-                    while tokens.eat(&Tok::Whitespace) || tokens.eat(&Tok::Newline) {}
-
-                    let arg_start_tokens = tokens.as_slice();
-                    // HACK(eddyb) find a nicer way to write this loop.
-                    let mut closing_paren = false;
-                    loop {
-                        match tokens.next()? {
-                            Tok::Punct('(') => {
-                                let mut depth = 1;
-                                while depth > 0 {
-                                    match tokens.next()? {
-                                        Tok::Punct('(') => depth += 1,
-                                        Tok::Punct(')') => depth -= 1,
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            Tok::Punct(')') => {
-                                closing_paren = true;
-                                break;
-                            }
-
-                            Tok::Punct(',') if is_variadic && args.len() == param_count => {}
-                            Tok::Punct(',') => break,
-
-                            _ => {}
-                        }
-                    }
-
-                    // The extra token not included in the argument is `,` or `)`.
-                    let non_arg_tokens = tokens.as_slice().len() + 1;
-                    let mut arg_tokens =
-                        &arg_start_tokens[..arg_start_tokens.len() - non_arg_tokens];
-                    while let Some((Tok::Whitespace, rest)) | Some((Tok::Newline, rest)) =
-                        arg_tokens.split_last()
-                    {
-                        arg_tokens = rest;
-                    }
-                    args.push(arg_tokens);
-
-                    if closing_paren {
-                        if is_variadic && args.len() == param_count {
-                            args.push(&[]);
-                        }
-                        return if args.len() == expected_args {
-                            Some(args)
-                        } else {
-                            None
-                        };
-                    } else {
-                        if args.len() == expected_args {
-                            return None;
-                        }
-                    }
-                }
-            })?
+            args
         } else {
             vec![]
         };
@@ -441,12 +429,11 @@ impl Macro<'_> {
             },
 
             MacroBody::CondOnly(special) => {
-                let value = match special {
-                    // FIXME(eddyb) all of the `return None` in here are wrong
-                    // because of how `tokens.try_eat` is used. However, the effect
-                    // of this is not observable outside of `#if` conditions, because
-                    // of the `originates_from_cond` check above.
+                if !outer.originates_from_cond() {
+                    return None;
+                }
 
+                let value = match special {
                     // FIXME(eddyb) handle these more uniformly with the rest.
                     SpecialCondMacro::HasInclude | SpecialCondMacro::HasIncludeNext => {
                         return None;
@@ -673,7 +660,9 @@ impl Phase4<'_> {
                         }
                     }
 
-                    if let Some(expanded_tokens) = m.try_expand(name, self, outer, &mut tokens) {
+                    if let Some(expanded_tokens) =
+                        tokens.try_eat(|arg_tokens| m.try_expand(name, self, outer, arg_tokens))
+                    {
                         output_tokens.extend(expanded_tokens);
                         any_expansions = true;
                         continue;
