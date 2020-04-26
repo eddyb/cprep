@@ -434,9 +434,24 @@ impl Macro<'_> {
                 }
 
                 let value = match special {
-                    // FIXME(eddyb) handle these more uniformly with the rest.
                     SpecialCondMacro::HasInclude | SpecialCondMacro::HasIncludeNext => {
-                        return None;
+                        let mut tokens = args[0].iter();
+                        let (style, header_name) = parse_header_name(&mut tokens)?;
+                        if tokens.next().is_some() {
+                            return None;
+                        }
+
+                        let start_after = if let SpecialCondMacro::HasIncludeNext = special {
+                            phase4.enclosing_header
+                        } else {
+                            None
+                        };
+                        phase4.headers.has_include(
+                            style,
+                            phase4.enclosing_src_file,
+                            &header_name,
+                            start_after,
+                        )
                     }
 
                     SpecialCondMacro::HasAttribute => match args[0] {
@@ -622,44 +637,6 @@ impl Phase4<'_> {
                 }
 
                 if let Some(m) = self.defines.get(&name[..]) {
-                    let cond_only_special = match m.body {
-                        MacroBody::CondOnly(special) if outer.originates_from_cond() => {
-                            Some(special)
-                        }
-                        _ => None,
-                    };
-                    if let Some(special @ SpecialCondMacro::HasInclude)
-                    | Some(special @ SpecialCondMacro::HasIncludeNext) = cond_only_special
-                    {
-                        if let Some((style, header_name)) = tokens.try_eat(|tokens| {
-                            tokens.eat(&Tok::Whitespace);
-                            if tokens.eat(&Tok::Punct('(')) {
-                                tokens.eat(&Tok::Whitespace);
-                                let header_name = parse_header_name(tokens)?;
-                                tokens.eat(&Tok::Whitespace);
-                                if tokens.eat(&Tok::Punct(')')) {
-                                    return Some(header_name);
-                                }
-                            }
-                            None
-                        }) {
-                            let start_after = if let SpecialCondMacro::HasIncludeNext = special {
-                                self.enclosing_header
-                            } else {
-                                None
-                            };
-                            let has_include = self.headers.has_include(
-                                style,
-                                self.enclosing_src_file,
-                                &header_name,
-                                start_after,
-                            );
-                            output_tokens.push(Tok::Literal((has_include as u8).to_string()));
-                            any_expansions = true;
-                            continue;
-                        }
-                    }
-
                     if let Some(expanded_tokens) =
                         tokens.try_eat(|arg_tokens| m.try_expand(name, self, outer, arg_tokens))
                     {
