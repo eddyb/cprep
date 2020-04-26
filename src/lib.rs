@@ -34,15 +34,46 @@ trait Eat: Iterator + Clone {
     }
 }
 
-impl<I: Iterator + Clone> Eat for I where Self::Item: Eq {}
+impl<I: Iterator + Clone> Eat for I {}
+
+#[derive(Clone, Debug)]
+pub struct Ident {
+    string: String,
+    physical_line: usize,
+}
+
+impl PartialEq for Ident {
+    fn eq(&self, other: &Ident) -> bool {
+        &self[..] == &other[..]
+    }
+}
+
+impl std::ops::Deref for Ident {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.string
+    }
+}
+
+impl PartialEq<str> for Ident {
+    fn eq(&self, other: &str) -> bool {
+        &self[..] == other
+    }
+}
+
+impl PartialEq<&'_ str> for Ident {
+    fn eq(&self, &other: &&str) -> bool {
+        &self[..] == other
+    }
+}
 
 // FIXME(eddyb) avoid cloning, build ropes, etc.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Tok {
     Newline,
     Whitespace,
     Punct(char),
-    Ident(String),
+    Ident(Ident),
     Literal(String),
     Error(char),
 }
@@ -53,7 +84,8 @@ impl fmt::Display for Tok {
             Tok::Newline => f.write_str("\n"),
             Tok::Whitespace => f.write_str(" "),
             Tok::Punct(c) | Tok::Error(c) => write!(f, "{}", c),
-            Tok::Ident(s) | Tok::Literal(s) => f.write_str(s),
+            Tok::Ident(s) => f.write_str(s),
+            Tok::Literal(s) => f.write_str(s),
         }
     }
 }

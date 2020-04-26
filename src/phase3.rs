@@ -1,5 +1,5 @@
 use crate::phase2::Phase2;
-use crate::{Eat, Tok};
+use crate::{Eat, Ident, Tok};
 use std::fmt;
 
 // FIXME(eddyb) avoid using `Eat` with a `Tok` iterator.
@@ -46,6 +46,7 @@ impl Iterator for Phase3<'_> {
             return Some(Tok::Whitespace);
         }
 
+        let physical_line = self.phase2.physical_line;
         let c = self.phase2.next()?;
         Some(match c {
             '\n' => Tok::Newline,
@@ -62,7 +63,10 @@ impl Iterator for Phase3<'_> {
                 {
                     ident.push(c);
                 }
-                Tok::Ident(ident)
+                Tok::Ident(Ident {
+                    string: ident,
+                    physical_line,
+                })
             }
 
             '.' | '0'..='9' => {
@@ -145,7 +149,7 @@ impl fmt::Display for Group {
 pub enum GroupPart {
     Verbatim(Vec<Tok>),
     Directive {
-        name: String,
+        maybe_name: Option<Ident>,
         tokens: Vec<Tok>,
     },
     IfElse {
@@ -164,8 +168,12 @@ impl fmt::Display for GroupPart {
                 }
                 Ok(())
             }
-            GroupPart::Directive { name, tokens } => {
-                write!(f, "#{} ", name)?;
+            GroupPart::Directive { maybe_name, tokens } => {
+                write!(f, "#")?;
+                if let Some(name) = maybe_name {
+                    f.write_str(name)?;
+                }
+                write!(f, " ")?;
                 for tok in tokens {
                     write!(f, "{}", tok)?;
                 }
@@ -193,13 +201,21 @@ impl Phase3<'_> {
         let mut then = Group { parts: vec![] };
         let mut else_ = Group { parts: vec![] };
         while let Some(part) = self.group_part() {
-            if let GroupPart::Directive { name, tokens } = &part {
+            if let GroupPart::Directive {
+                maybe_name: Some(name),
+                tokens,
+            } = &part
+            {
                 if name == "endif" && tokens.is_empty() {
                     break;
                 }
                 if name == "else" && tokens.is_empty() {
                     while let Some(part) = self.group_part() {
-                        if let GroupPart::Directive { name, tokens } = &part {
+                        if let GroupPart::Directive {
+                            maybe_name: Some(name),
+                            tokens,
+                        } = &part
+                        {
                             if name == "endif" && tokens.is_empty() {
                                 break;
                             }
@@ -231,9 +247,9 @@ impl Phase3<'_> {
         if self.eat(Tok::Punct('#')) {
             self.eat(Tok::Whitespace);
 
-            let name = match self.eat_if(|tok| matches!(tok, Tok::Ident(_))) {
-                Some(Tok::Ident(name)) => name,
-                _ => String::new(),
+            let maybe_name = match self.eat_if(|tok| matches!(tok, Tok::Ident(_))) {
+                Some(Tok::Ident(name)) => Some(name),
+                _ => None,
             };
 
             self.eat(Tok::Whitespace);
@@ -250,23 +266,28 @@ impl Phase3<'_> {
                 tokens.pop();
             }
 
-            if let "if" | "ifdef" | "ifndef" = &name[..] {
-                let mut cond = vec![];
-                if let "ifdef" | "ifndef" = &name[..] {
-                    if name == "ifndef" {
-                        cond.push(Tok::Punct('!'));
+            if let Some(name) = &maybe_name {
+                if let "if" | "ifdef" | "ifndef" = &name[..] {
+                    let mut cond = vec![];
+                    if let "ifdef" | "ifndef" = &name[..] {
+                        if name == "ifndef" {
+                            cond.push(Tok::Punct('!'));
+                        }
+                        cond.push(Tok::Ident(Ident {
+                            string: "defined".to_string(),
+                            physical_line: name.physical_line,
+                        }));
+                        cond.push(Tok::Whitespace);
                     }
-                    cond.push(Tok::Ident("defined".to_string()));
-                    cond.push(Tok::Whitespace);
+                    cond.extend(tokens);
+
+                    let (then, else_) = self.then_else_groups();
+
+                    return Some(GroupPart::IfElse { cond, then, else_ });
                 }
-                cond.extend(tokens);
-
-                let (then, else_) = self.then_else_groups();
-
-                return Some(GroupPart::IfElse { cond, then, else_ });
             }
 
-            return Some(GroupPart::Directive { name, tokens });
+            return Some(GroupPart::Directive { maybe_name, tokens });
         }
 
         let mut verbatim_tokens = vec![];

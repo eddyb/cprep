@@ -1,7 +1,7 @@
 use crate::headers::{Header, Headers, IncludeStyle};
 use crate::phase3::{Group, GroupPart, Phase3};
 use crate::sources::SourceFile;
-use crate::{Eat, Tok};
+use crate::{Eat, Ident, Tok};
 use indexmap::IndexSet;
 use std::collections::HashMap;
 use std::convert::TryInto;
@@ -286,7 +286,7 @@ enum OuterExpansion<'a> {
     File,
     Cond,
     Macro {
-        name: &'a str,
+        name: &'a Ident,
         outer: &'a OuterExpansion<'a>,
     },
 }
@@ -309,13 +309,24 @@ impl OuterExpansion<'_> {
             OuterExpansion::Macro { name: _, outer } => outer.originates_from_cond(),
         }
     }
+
+    fn outermost_physical_line(self) -> Option<usize> {
+        match self {
+            OuterExpansion::File | OuterExpansion::Cond => None,
+            OuterExpansion::Macro { name, outer } => Some(
+                outer
+                    .outermost_physical_line()
+                    .unwrap_or(name.physical_line),
+            ),
+        }
+    }
 }
 
 impl Macro<'_> {
     // FIXME(eddyb) consider changing code like this to take a `&mut Vec<Tok>`
     fn try_expand(
         &self,
-        name: &str,
+        name: &Ident,
         phase4: &Phase4<'_>,
         outer: &OuterExpansion<'_>,
         args_tokens: &mut std::slice::Iter<'_, Tok>,
@@ -424,7 +435,10 @@ impl Macro<'_> {
                 }
 
                 BuiltinMacro::Line => {
-                    return Some(vec![Tok::Literal(0.to_string())]);
+                    let physical_line = outer
+                        .outermost_physical_line()
+                        .unwrap_or(name.physical_line);
+                    return Some(vec![Tok::Literal(physical_line.to_string())]);
                 }
             },
 
@@ -566,9 +580,16 @@ impl Macro<'_> {
                                 (None, Some(tok)) | (Some(tok), None) => Some(tok),
                                 (Some(lhs), Some(rhs)) => match (lhs, rhs) {
                                     // This is the most common usecase, implement it directly.
-                                    (Tok::Ident(lhs), Tok::Ident(rhs)) => {
-                                        Some(Tok::Ident(lhs + &rhs))
-                                    }
+                                    (Tok::Ident(lhs), Tok::Ident(rhs)) => Some(Tok::Ident(Ident {
+                                        string: lhs.string + &rhs.string,
+                                        // FIXME(eddyb) is this correct? should we even be able to
+                                        // observe the result of a macro expansion via `__LINE__`,
+                                        // without there being an overriding outer expansion?
+                                        // Maybe `0` or `None::<NonZeroUsize>` could be used to
+                                        // indicate a synthethic identifier that `__LINE__` would
+                                        // panic if it ever sees.
+                                        physical_line: lhs.physical_line,
+                                    })),
 
                                     // Anything else goes through a reparse of the
                                     // concatenated source forms.
@@ -826,7 +847,9 @@ impl<'a> Phase4<'a> {
                 GroupPart::Verbatim(tokens) => {
                     output_tokens.extend(self.expand_macros(tokens, &OuterExpansion::File));
                 }
-                GroupPart::Directive { name, tokens } => {
+                GroupPart::Directive { maybe_name, tokens } => {
+                    let name = maybe_name.as_ref().map_or("", |name| &name[..]);
+
                     if name == "include"
                         || name == "include_next" && self.enclosing_header.is_some()
                     {
@@ -901,8 +924,8 @@ impl<'a> Phase4<'a> {
 
                     // FIXME(eddyb) DRY this.
                     output_tokens.push(Tok::Punct('#'));
-                    if !name.is_empty() {
-                        output_tokens.push(Tok::Ident(name.to_string()));
+                    if let Some(name) = maybe_name {
+                        output_tokens.push(Tok::Ident(name.clone()));
                     }
                     if !tokens.is_empty() {
                         output_tokens.push(Tok::Whitespace);
@@ -933,12 +956,14 @@ impl<'a> Phase4<'a> {
         for part in &group.parts {
             match part {
                 GroupPart::Verbatim(_) => {}
-                GroupPart::Directive { name, tokens } => {
-                    if name == "include" || name == "include_next" {
-                        let mut tokens = tokens.iter();
-                        if let Some((_, header_name)) = parse_header_name(&mut tokens) {
-                            if tokens.next().is_none() {
-                                includes.push(header_name);
+                GroupPart::Directive { maybe_name, tokens } => {
+                    if let Some(name) = maybe_name {
+                        if name == "include" || name == "include_next" {
+                            let mut tokens = tokens.iter();
+                            if let Some((_, header_name)) = parse_header_name(&mut tokens) {
+                                if tokens.next().is_none() {
+                                    includes.push(header_name);
+                                }
                             }
                         }
                     }
