@@ -50,6 +50,7 @@ enum ConcatPart<'a> {
 #[derive(Copy, Clone)]
 enum BuiltinMacro {
     File,
+    Line,
 }
 
 #[derive(Copy, Clone)]
@@ -225,39 +226,42 @@ pub struct Phase4<'a> {
 
 impl<'a> Phase4<'a> {
     pub fn new(src: &'a SourceFile, headers: &'a Headers) -> Self {
-        let defines = [("__FILE__", BuiltinMacro::File)]
+        let defines = [
+            ("__FILE__", BuiltinMacro::File),
+            ("__LINE__", BuiltinMacro::Line),
+        ]
+        .iter()
+        .map(|&(name, builtin)| {
+            (
+                name,
+                Macro {
+                    params: None,
+                    body: MacroBody::Builtin(builtin),
+                },
+            )
+        })
+        .chain(
+            [
+                ("__has_attribute", SpecialCondMacro::HasAttribute),
+                ("__has_builtin", SpecialCondMacro::HasBuiltin),
+                ("__has_cpp_attribute", SpecialCondMacro::HasCppAttribute),
+                ("__has_feature", SpecialCondMacro::HasFeature),
+                ("__has_include", SpecialCondMacro::HasInclude),
+                ("__has_include_next", SpecialCondMacro::HasIncludeNext),
+                ("__is_identifier", SpecialCondMacro::IsIdentifier),
+            ]
             .iter()
-            .map(|&(name, builtin)| {
+            .map(|&(name, special)| {
                 (
                     name,
                     Macro {
-                        params: None,
-                        body: MacroBody::Builtin(builtin),
+                        params: Some((1, false)),
+                        body: MacroBody::CondOnly(special),
                     },
                 )
-            })
-            .chain(
-                [
-                    ("__has_attribute", SpecialCondMacro::HasAttribute),
-                    ("__has_builtin", SpecialCondMacro::HasBuiltin),
-                    ("__has_cpp_attribute", SpecialCondMacro::HasCppAttribute),
-                    ("__has_feature", SpecialCondMacro::HasFeature),
-                    ("__has_include", SpecialCondMacro::HasInclude),
-                    ("__has_include_next", SpecialCondMacro::HasIncludeNext),
-                    ("__is_identifier", SpecialCondMacro::IsIdentifier),
-                ]
-                .iter()
-                .map(|&(name, special)| {
-                    (
-                        name,
-                        Macro {
-                            params: Some((1, false)),
-                            body: MacroBody::CondOnly(special),
-                        },
-                    )
-                }),
-            )
-            .collect();
+            }),
+        )
+        .collect();
 
         Phase4 {
             enclosing_src_file: src,
@@ -386,6 +390,10 @@ impl Macro<'_> {
 
                     // FIXME(eddyb) use custom escaping instead of Rust `{:?}`.
                     return Some(vec![Tok::Literal(format!("{:?}", file_path))]);
+                }
+
+                BuiltinMacro::Line => {
+                    return Some(vec![Tok::Literal(0.to_string())]);
                 }
             },
 
