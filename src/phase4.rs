@@ -3,7 +3,7 @@ use crate::phase3::{Group, GroupPart, Phase3};
 use crate::sources::SourceFile;
 use crate::{Eat, Tok};
 use indexmap::IndexSet;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fmt::Write;
 use std::iter;
@@ -281,16 +281,37 @@ impl<'a> Phase4<'a> {
     }
 }
 
+#[derive(Copy, Clone)]
+enum OuterExpansion<'a> {
+    File,
+    Macro {
+        name: &'a str,
+        outer: &'a OuterExpansion<'a>,
+    },
+}
+
+impl OuterExpansion<'_> {
+    fn is_expanding(self, name: &str) -> bool {
+        match self {
+            OuterExpansion::File => false,
+            OuterExpansion::Macro {
+                name: expanding_name,
+                outer,
+            } => expanding_name == name || outer.is_expanding(name),
+        }
+    }
+}
+
 impl Macro<'_> {
     // FIXME(eddyb) consider changing code like this to take a `&mut Vec<Tok>`
-    fn try_expand<'d>(
+    fn try_expand(
         &self,
-        name: &'d str,
-        phase4: &Phase4<'d>,
-        in_progress: &mut HashSet<&'d str>,
+        name: &str,
+        phase4: &Phase4<'_>,
+        outer: &OuterExpansion<'_>,
         input_tokens: &mut std::slice::Iter<'_, Tok>,
     ) -> Option<Vec<Tok>> {
-        if in_progress.contains(name) {
+        if outer.is_expanding(name) {
             return None;
         }
 
@@ -474,7 +495,7 @@ impl Macro<'_> {
                         substituted_tokens.extend_from_slice(verbatim_tokens);
                     }
                     &Replacement::Param(ParamMode::Normal, i) => {
-                        let mut expanded_arg = phase4.expand_macros(args[i], in_progress);
+                        let mut expanded_arg = phase4.expand_macros(args[i], outer);
 
                         // HACK(eddyb) for parity with existing preprocessors, flatten newlines.
                         // FIXME(eddyb) provide a way to control this behavior.
@@ -547,17 +568,13 @@ impl Macro<'_> {
             &substituted_tokens[..]
         };
 
-        assert!(in_progress.insert(name));
-        let output_tokens = phase4.expand_macros(&substituted_tokens, in_progress);
-        in_progress.remove(name);
-
-        Some(output_tokens)
+        Some(phase4.expand_macros(&substituted_tokens, &OuterExpansion::Macro { name, outer }))
     }
 }
 
-impl<'a> Phase4<'a> {
+impl Phase4<'_> {
     // FIXME(eddyb) consider changing code like this to take a `&mut Vec<Tok>`
-    fn expand_macros(&self, tokens: &[Tok], in_progress: &mut HashSet<&'a str>) -> Vec<Tok> {
+    fn expand_macros(&self, tokens: &[Tok], outer: &OuterExpansion<'_>) -> Vec<Tok> {
         // FIXME(eddyb) use `Cow` to optimize the case when no tokens are expanded.
         let mut output_tokens = vec![];
 
@@ -565,14 +582,13 @@ impl<'a> Phase4<'a> {
         let mut tokens = tokens.iter();
         while let Some(tok) = tokens.next() {
             if let Tok::Ident(name) = tok {
-                if let Some((&name, m)) = self.defines.get_key_value(&name[..]) {
+                if let Some(m) = self.defines.get(&name[..]) {
                     let allowed = match m.body {
                         MacroBody::Builtin(_) | MacroBody::Regular(_) => true,
                         MacroBody::CondOnly(_) => false,
                     };
                     if allowed {
-                        if let Some(expanded_tokens) =
-                            m.try_expand(name, self, in_progress, &mut tokens)
+                        if let Some(expanded_tokens) = m.try_expand(name, self, outer, &mut tokens)
                         {
                             output_tokens.extend(expanded_tokens);
                             any_expansions = true;
@@ -589,14 +605,12 @@ impl<'a> Phase4<'a> {
         let try_fixpoint = false;
         if any_expansions && try_fixpoint {
             // HACK(eddyb) this achieves fixpoint but is much more inefficient than it needs to be.
-            self.expand_macros(&output_tokens, in_progress)
+            self.expand_macros(&output_tokens, outer)
         } else {
             output_tokens
         }
     }
-}
 
-impl Phase4<'_> {
     fn expand_macros_in_cond(&self, tokens: &[Tok]) -> Vec<Tok> {
         // FIXME(eddyb) use `Cow` to optimize the case when no tokens are expanded.
         let mut output_tokens = vec![];
@@ -628,7 +642,7 @@ impl Phase4<'_> {
                     }
                 }
 
-                if let Some((&name, m)) = self.defines.get_key_value(&name[..]) {
+                if let Some(m) = self.defines.get(&name[..]) {
                     if let MacroBody::CondOnly(special @ SpecialCondMacro::HasInclude)
                     | MacroBody::CondOnly(special @ SpecialCondMacro::HasIncludeNext) = m.body
                     {
@@ -661,7 +675,7 @@ impl Phase4<'_> {
                     }
 
                     if let Some(expanded_tokens) =
-                        m.try_expand(name, self, &mut HashSet::new(), &mut tokens)
+                        m.try_expand(name, self, &OuterExpansion::File, &mut tokens)
                     {
                         output_tokens.extend(expanded_tokens);
                         continue;
@@ -839,7 +853,7 @@ impl<'a> Phase4<'a> {
         for part in &group.parts {
             match part {
                 GroupPart::Verbatim(tokens) => {
-                    output_tokens.extend(self.expand_macros(tokens, &mut HashSet::new()));
+                    output_tokens.extend(self.expand_macros(tokens, &OuterExpansion::File));
                 }
                 GroupPart::Directive { name, tokens } => {
                     if name == "include"
