@@ -284,6 +284,7 @@ impl<'a> Phase4<'a> {
 #[derive(Copy, Clone)]
 enum OuterExpansion<'a> {
     File,
+    Cond,
     Macro {
         name: &'a str,
         outer: &'a OuterExpansion<'a>,
@@ -293,11 +294,19 @@ enum OuterExpansion<'a> {
 impl OuterExpansion<'_> {
     fn is_expanding(self, name: &str) -> bool {
         match self {
-            OuterExpansion::File => false,
+            OuterExpansion::File | OuterExpansion::Cond => false,
             OuterExpansion::Macro {
                 name: expanding_name,
                 outer,
             } => expanding_name == name || outer.is_expanding(name),
+        }
+    }
+
+    fn originates_from_cond(self) -> bool {
+        match self {
+            OuterExpansion::File => false,
+            OuterExpansion::Cond => true,
+            OuterExpansion::Macro { name: _, outer } => outer.originates_from_cond(),
         }
     }
 }
@@ -313,6 +322,19 @@ impl Macro<'_> {
     ) -> Option<Vec<Tok>> {
         if outer.is_expanding(name) {
             return None;
+        }
+
+        // HACK(eddyb) return early to avoid parsing tokens below.
+        // FIXME(eddyb) move this check down and allow `return None`
+        // anywhere in this function without breaking anything.
+        match self.body {
+            MacroBody::CondOnly(_) => {
+                if !outer.originates_from_cond() {
+                    return None;
+                }
+            }
+
+            MacroBody::Builtin(_) | MacroBody::Regular(_) => {}
         }
 
         let args = if let Some((param_count, is_variadic)) = self.params {
@@ -420,6 +442,11 @@ impl Macro<'_> {
 
             MacroBody::CondOnly(special) => {
                 let value = match special {
+                    // FIXME(eddyb) all of the `return None` in here are wrong
+                    // because of how `tokens.try_eat` is used. However, the effect
+                    // of this is not observable outside of `#if` conditions, because
+                    // of the `originates_from_cond` check above.
+
                     // FIXME(eddyb) handle these more uniformly with the rest.
                     SpecialCondMacro::HasInclude | SpecialCondMacro::HasIncludeNext => {
                         return None;
@@ -582,43 +609,7 @@ impl Phase4<'_> {
         let mut tokens = tokens.iter();
         while let Some(tok) = tokens.next() {
             if let Tok::Ident(name) = tok {
-                if let Some(m) = self.defines.get(&name[..]) {
-                    let allowed = match m.body {
-                        MacroBody::Builtin(_) | MacroBody::Regular(_) => true,
-                        MacroBody::CondOnly(_) => false,
-                    };
-                    if allowed {
-                        if let Some(expanded_tokens) = m.try_expand(name, self, outer, &mut tokens)
-                        {
-                            output_tokens.extend(expanded_tokens);
-                            any_expansions = true;
-                            continue;
-                        }
-                    }
-                }
-            }
-
-            output_tokens.push(tok.clone());
-        }
-
-        // FIXME(eddyb) provide a way to control this, and/or optimize it.
-        let try_fixpoint = false;
-        if any_expansions && try_fixpoint {
-            // HACK(eddyb) this achieves fixpoint but is much more inefficient than it needs to be.
-            self.expand_macros(&output_tokens, outer)
-        } else {
-            output_tokens
-        }
-    }
-
-    fn expand_macros_in_cond(&self, tokens: &[Tok]) -> Vec<Tok> {
-        // FIXME(eddyb) use `Cow` to optimize the case when no tokens are expanded.
-        let mut output_tokens = vec![];
-
-        let mut tokens = tokens.iter();
-        while let Some(tok) = tokens.next() {
-            if let Tok::Ident(name) = tok {
-                if name == "defined" {
+                if name == "defined" && outer.originates_from_cond() {
                     if let Some(arg_name) = tokens.try_eat(|tokens| {
                         tokens.eat(&Tok::Whitespace);
                         match tokens.next()? {
@@ -638,13 +629,20 @@ impl Phase4<'_> {
                     }) {
                         let is_defined = self.defines.contains_key(&arg_name[..]);
                         output_tokens.push(Tok::Literal((is_defined as u8).to_string()));
+                        any_expansions = true;
                         continue;
                     }
                 }
 
                 if let Some(m) = self.defines.get(&name[..]) {
-                    if let MacroBody::CondOnly(special @ SpecialCondMacro::HasInclude)
-                    | MacroBody::CondOnly(special @ SpecialCondMacro::HasIncludeNext) = m.body
+                    let cond_only_special = match m.body {
+                        MacroBody::CondOnly(special) if outer.originates_from_cond() => {
+                            Some(special)
+                        }
+                        _ => None,
+                    };
+                    if let Some(special @ SpecialCondMacro::HasInclude)
+                    | Some(special @ SpecialCondMacro::HasIncludeNext) = cond_only_special
                     {
                         if let Some((style, header_name)) = tokens.try_eat(|tokens| {
                             tokens.eat(&Tok::Whitespace);
@@ -670,14 +668,14 @@ impl Phase4<'_> {
                                 start_after,
                             );
                             output_tokens.push(Tok::Literal((has_include as u8).to_string()));
+                            any_expansions = true;
                             continue;
                         }
                     }
 
-                    if let Some(expanded_tokens) =
-                        m.try_expand(name, self, &OuterExpansion::File, &mut tokens)
-                    {
+                    if let Some(expanded_tokens) = m.try_expand(name, self, outer, &mut tokens) {
                         output_tokens.extend(expanded_tokens);
+                        any_expansions = true;
                         continue;
                     }
                 }
@@ -686,7 +684,14 @@ impl Phase4<'_> {
             output_tokens.push(tok.clone());
         }
 
-        output_tokens
+        // FIXME(eddyb) provide a way to control this, and/or optimize it.
+        let try_fixpoint = false;
+        if any_expansions && try_fixpoint {
+            // HACK(eddyb) this achieves fixpoint but is much more inefficient than it needs to be.
+            self.expand_macros(&output_tokens, outer)
+        } else {
+            output_tokens
+        }
     }
 }
 
@@ -940,7 +945,7 @@ impl<'a> Phase4<'a> {
                     output_tokens.push(Tok::Newline);
                 }
                 GroupPart::IfElse { cond, then, else_ } => {
-                    let cond = self.expand_macros_in_cond(cond);
+                    let cond = self.expand_macros(cond, &OuterExpansion::Cond);
                     let cond_eval = CondEval {
                         tokens: cond.iter(),
                     };
