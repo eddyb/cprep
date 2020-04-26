@@ -416,22 +416,44 @@ impl Macro<'_> {
             vec![]
         };
 
-        let stringify_arg = |i| {
+        let escaped_str_lit = |s: &str| {
+            let mut lit = String::new();
+
+            lit.push('"');
+            // FIXME(eddyb) use a faster algorithm taking advantage
+            // of the fact that escaping is rarely needed.
+            for c in s.chars() {
+                if c == '\\' || c == '"' {
+                    lit.push('\\');
+                }
+                lit.push(c);
+            }
+            lit.push('"');
+
+            Tok::Literal(lit)
+        };
+
+        let stringify_arg = |i: usize| {
             let mut stringified = String::new();
             for tok in args[i] {
-                let _ = write!(stringified, "{}", tok);
+                // Newlines are flattened into spaces.
+                if let Tok::Whitespace | Tok::Newline = tok {
+                    // And spaces are deduplicated.
+                    if !stringified.ends_with(" ") {
+                        stringified.push(' ');
+                    }
+                } else {
+                    let _ = write!(stringified, "{}", tok);
+                }
             }
-            // FIXME(eddyb) use custom escaping instead of Rust `{:?}`.
-            Tok::Literal(format!("{:?}", stringified))
+            escaped_str_lit(&stringified)
         };
 
         let replacements = match &self.body {
             MacroBody::Builtin(builtin) => match builtin {
                 BuiltinMacro::File => {
                     let file_path = phase4.enclosing_src_file.path.display().to_string();
-
-                    // FIXME(eddyb) use custom escaping instead of Rust `{:?}`.
-                    return Some(vec![Tok::Literal(format!("{:?}", file_path))]);
+                    return Some(vec![escaped_str_lit(&file_path)]);
                 }
 
                 BuiltinMacro::Line => {
