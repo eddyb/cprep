@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::fmt::Write;
 use std::iter;
+use std::mem;
 
 fn parse_header_name(tokens: &mut std::slice::Iter<Tok>) -> Option<(IncludeStyle, String)> {
     tokens.try_eat(|tokens| match tokens.next()? {
@@ -47,7 +48,7 @@ enum ConcatPart<'a> {
 }
 
 #[derive(Clone)]
-pub struct Macro<'a> {
+struct Macro<'a> {
     params: Option<(usize, bool)>,
     replacements: Vec<Replacement<'a>>,
 }
@@ -190,12 +191,41 @@ impl<'a> Macro<'a> {
             replacements,
         }
     }
+}
 
+pub struct Phase4<'a> {
+    enclosing_src_file: &'a SourceFile,
+    enclosing_header: Option<&'a Header>,
+    headers: &'a Headers,
+    defines: HashMap<&'a str, Macro<'a>>,
+}
+
+impl<'a> Phase4<'a> {
+    pub fn new(src: &'a SourceFile, headers: &'a Headers) -> Self {
+        Phase4 {
+            enclosing_src_file: src,
+            enclosing_header: None,
+            headers,
+            defines: HashMap::new(),
+        }
+    }
+
+    pub fn with_defines_from(src: &'a SourceFile, phase4: &Phase4<'a>) -> Self {
+        Phase4 {
+            enclosing_src_file: src,
+            enclosing_header: None,
+            headers: phase4.headers,
+            defines: phase4.defines.clone(),
+        }
+    }
+}
+
+impl Macro<'_> {
     // FIXME(eddyb) consider changing code like this to take a `&mut Vec<Tok>`
     fn expand<'d>(
         &self,
         name: &'d str,
-        defines: &HashMap<&'d str, Macro<'_>>,
+        phase4: &Phase4<'d>,
         in_progress: &mut HashSet<&'d str>,
         input_tokens: &mut std::slice::Iter<'_, Tok>,
     ) -> Option<Vec<Tok>> {
@@ -305,7 +335,7 @@ impl<'a> Macro<'a> {
                         substituted_tokens.extend_from_slice(verbatim_tokens);
                     }
                     &Replacement::Param(ParamMode::Normal, i) => {
-                        let mut expanded_arg = expand_macros(args[i], defines, in_progress);
+                        let mut expanded_arg = phase4.expand_macros(args[i], in_progress);
 
                         // HACK(eddyb) for parity with existing preprocessors, flatten newlines.
                         // FIXME(eddyb) provide a way to control this behavior.
@@ -379,17 +409,23 @@ impl<'a> Macro<'a> {
         };
 
         assert!(in_progress.insert(name));
-        let output_tokens = expand_macros(&substituted_tokens, defines, in_progress);
+        let output_tokens = phase4.expand_macros(&substituted_tokens, in_progress);
         in_progress.remove(name);
 
         Some(output_tokens)
     }
 }
 
+impl<'a> Phase4<'a> {
+    fn expand_macros(&self, tokens: &[Tok], in_progress: &mut HashSet<&'a str>) -> Vec<Tok> {
+        expand_macros(tokens, self, in_progress)
+    }
+}
+
 // FIXME(eddyb) consider changing code like this to take a `&mut Vec<Tok>`
 fn expand_macros<'d>(
     tokens: &[Tok],
-    defines: &HashMap<&'d str, Macro<'_>>,
+    phase4: &Phase4<'d>,
     in_progress: &mut HashSet<&'d str>,
 ) -> Vec<Tok> {
     // FIXME(eddyb) use `Cow` to optimize the case when no tokens are expanded.
@@ -399,8 +435,8 @@ fn expand_macros<'d>(
     let mut tokens = tokens.iter();
     while let Some(tok) = tokens.next() {
         if let Tok::Ident(name) = tok {
-            if let Some((&name, m)) = defines.get_key_value(&name[..]) {
-                if let Some(expanded_tokens) = m.expand(name, defines, in_progress, &mut tokens) {
+            if let Some((&name, m)) = phase4.defines.get_key_value(&name[..]) {
+                if let Some(expanded_tokens) = m.expand(name, phase4, in_progress, &mut tokens) {
                     output_tokens.extend(expanded_tokens);
                     any_expansions = true;
                     continue;
@@ -415,7 +451,7 @@ fn expand_macros<'d>(
     let try_fixpoint = false;
     if any_expansions && try_fixpoint {
         // HACK(eddyb) this achieves fixpoint but is much more inefficient than it needs to be.
-        expand_macros(&output_tokens, defines, in_progress)
+        phase4.expand_macros(&output_tokens, in_progress)
     } else {
         output_tokens
     }
@@ -446,13 +482,13 @@ impl SpecialCondMacro {
     }
 }
 
-fn expand_macros_in_cond(
-    tokens: &[Tok],
-    enclosing_src_file: &SourceFile,
-    enclosing_header: Option<&Header>,
-    headers: &Headers,
-    defines: &HashMap<&str, Macro>,
-) -> Vec<Tok> {
+impl Phase4<'_> {
+    fn expand_macros_in_cond(&self, tokens: &[Tok]) -> Vec<Tok> {
+        expand_macros_in_cond(tokens, self)
+    }
+}
+
+fn expand_macros_in_cond(tokens: &[Tok], phase4: &Phase4) -> Vec<Tok> {
     // FIXME(eddyb) use `Cow` to optimize the case when no tokens are expanded.
     let mut output_tokens = vec![];
 
@@ -478,7 +514,7 @@ fn expand_macros_in_cond(
                     }
                 }) {
                     let is_defined = SpecialCondMacro::from_ident(arg_name).is_some()
-                        || defines.contains_key(&arg_name[..]);
+                        || phase4.defines.contains_key(&arg_name[..]);
                     output_tokens.push(Tok::Literal((is_defined as u8).to_string()));
                     continue;
                 }
@@ -501,20 +537,24 @@ fn expand_macros_in_cond(
                     None
                 }) {
                     let start_after = if let SpecialCondMacro::HasIncludeNext = special {
-                        enclosing_header
+                        phase4.enclosing_header
                     } else {
                         None
                     };
-                    let has_include =
-                        headers.has_include(style, enclosing_src_file, &header_name, start_after);
+                    let has_include = phase4.headers.has_include(
+                        style,
+                        phase4.enclosing_src_file,
+                        &header_name,
+                        start_after,
+                    );
                     output_tokens.push(Tok::Literal((has_include as u8).to_string()));
                     continue;
                 }
             }
 
-            if let Some((&name, m)) = defines.get_key_value(&name[..]) {
+            if let Some((&name, m)) = phase4.defines.get_key_value(&name[..]) {
                 if let Some(expanded_tokens) =
-                    m.expand(name, defines, &mut HashSet::new(), &mut tokens)
+                    m.expand(name, phase4, &mut HashSet::new(), &mut tokens)
                 {
                     output_tokens.extend(expanded_tokens);
                     continue;
@@ -740,51 +780,49 @@ impl<'a> CondEval<'a> {
     }
 }
 
-pub fn phase4<'a>(
-    src: &'a SourceFile,
-    headers: &'a Headers,
-    defines: &mut HashMap<&'a str, Macro<'a>>,
-) -> Vec<Tok> {
-    phase4_inner(&src.phase3_group, src, None, headers, defines)
+impl<'a> Phase4<'a> {
+    pub fn expand(&mut self) -> Vec<Tok> {
+        self.expand_group(&self.enclosing_src_file.phase3_group)
+    }
+
+    fn expand_group(&mut self, group: &'a Group) -> Vec<Tok> {
+        expand_group(group, self)
+    }
 }
 
-pub fn phase4_inner<'a>(
-    group: &'a Group,
-    enclosing_src_file: &SourceFile,
-    enclosing_header: Option<&Header>,
-    headers: &'a Headers,
-    defines: &mut HashMap<&'a str, Macro<'a>>,
-) -> Vec<Tok> {
+fn expand_group<'a>(group: &'a Group, phase4: &mut Phase4<'a>) -> Vec<Tok> {
     let mut output_tokens = vec![];
 
     for part in &group.parts {
         match part {
             GroupPart::Verbatim(tokens) => {
-                output_tokens.extend(expand_macros(tokens, defines, &mut HashSet::new()));
+                output_tokens.extend(phase4.expand_macros(tokens, &mut HashSet::new()));
             }
             GroupPart::Directive { name, tokens } => {
-                if name == "include" || name == "include_next" && enclosing_header.is_some() {
+                if name == "include" || name == "include_next" && phase4.enclosing_header.is_some()
+                {
                     let mut tokens = tokens.iter();
                     if let Some((style, header_name)) = parse_header_name(&mut tokens) {
                         if tokens.next().is_none() {
                             let start_after = if name == "include_next" {
-                                enclosing_header
+                                phase4.enclosing_header
                             } else {
                                 None
                             };
-                            if let Some(header) = headers.include(
+                            if let Some(header) = phase4.headers.include(
                                 style,
-                                enclosing_src_file,
+                                phase4.enclosing_src_file,
                                 &header_name,
                                 start_after,
                             ) {
-                                output_tokens.extend(phase4_inner(
-                                    &header.src.phase3_group,
-                                    &header.src,
-                                    Some(header),
-                                    headers,
-                                    defines,
-                                ));
+                                let mut header_phase4 = Phase4 {
+                                    enclosing_src_file: &header.src,
+                                    enclosing_header: Some(header),
+                                    headers: phase4.headers,
+                                    defines: mem::take(&mut phase4.defines),
+                                };
+                                output_tokens.extend(header_phase4.expand());
+                                phase4.defines = header_phase4.defines;
                                 continue;
                             }
                         }
@@ -794,14 +832,14 @@ pub fn phase4_inner<'a>(
                 if name == "define" {
                     let mut tokens = tokens.iter();
                     if let Some(Tok::Ident(name)) = tokens.next() {
-                        defines.insert(name, Macro::parse(tokens));
+                        phase4.defines.insert(name, Macro::parse(tokens));
                         continue;
                     }
                 }
 
                 if name == "undef" {
                     if let [Tok::Ident(name)] = &tokens[..] {
-                        defines.remove(&name[..]);
+                        phase4.defines.remove(&name[..]);
                         continue;
                     }
                 }
@@ -842,31 +880,25 @@ pub fn phase4_inner<'a>(
                 output_tokens.push(Tok::Newline);
             }
             GroupPart::IfElse { cond, then, else_ } => {
-                let cond = expand_macros_in_cond(
-                    cond,
-                    enclosing_src_file,
-                    enclosing_header,
-                    headers,
-                    defines,
-                );
+                let cond = phase4.expand_macros_in_cond(cond);
                 let cond_eval = CondEval {
                     tokens: cond.iter(),
                 };
                 let group = if cond_eval.eval() { then } else { else_ };
-                output_tokens.extend(phase4_inner(
-                    group,
-                    enclosing_src_file,
-                    enclosing_header,
-                    headers,
-                    defines,
-                ));
+                output_tokens.extend(phase4.expand_group(group));
             }
         }
     }
     output_tokens
 }
 
-pub fn scan_for_includes(group: &Group) -> Vec<String> {
+impl Phase4<'_> {
+    pub fn scan_for_includes(&self) -> Vec<String> {
+        scan_for_includes(&self.enclosing_src_file.phase3_group)
+    }
+}
+
+fn scan_for_includes(group: &Group) -> Vec<String> {
     let mut includes = vec![];
 
     for part in &group.parts {

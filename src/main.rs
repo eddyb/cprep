@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::prelude::*;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -28,15 +28,14 @@ fn main() -> Result<(), std::io::Error> {
         }
     };
     let builtin_defines = {
-        let mut defines = HashMap::new();
-        cprep::phase4::phase4(&builtin_defines, &headers, &mut defines);
-        defines
+        let mut phase4 = cprep::phase4::Phase4::new(&builtin_defines, &headers);
+        phase4.expand();
+        phase4
     };
 
     if let Some(path) = std::env::args().nth(1) {
         let src = cprep::sources::SourceFile::load(PathBuf::from(path))?;
-        let mut defines = builtin_defines.clone();
-        for tok in cprep::phase4::phase4(&src, &headers, &mut defines) {
+        for tok in cprep::phase4::Phase4::with_defines_from(&src, &builtin_defines).expand() {
             print!("{}", tok);
         }
         return Ok(());
@@ -78,7 +77,7 @@ fn main() -> Result<(), std::io::Error> {
         for (relative_path, header) in &found_headers {
             let node = relative_path.display().to_string();
             writeln!(dot, "    {:?};", node)?;
-            for include in cprep::phase4::scan_for_includes(&header.src.phase3_group) {
+            for include in cprep::phase4::Phase4::new(&header.src, &headers).scan_for_includes() {
                 if !found_headers.contains_key(Path::new(&include)) {
                     writeln!(dot, "    {:?} [style=dashed];", include)?
                 }
