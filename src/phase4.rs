@@ -417,43 +417,35 @@ impl Macro<'_> {
 }
 
 impl<'a> Phase4<'a> {
+    // FIXME(eddyb) consider changing code like this to take a `&mut Vec<Tok>`
     fn expand_macros(&self, tokens: &[Tok], in_progress: &mut HashSet<&'a str>) -> Vec<Tok> {
-        expand_macros(tokens, self, in_progress)
-    }
-}
+        // FIXME(eddyb) use `Cow` to optimize the case when no tokens are expanded.
+        let mut output_tokens = vec![];
 
-// FIXME(eddyb) consider changing code like this to take a `&mut Vec<Tok>`
-fn expand_macros<'d>(
-    tokens: &[Tok],
-    phase4: &Phase4<'d>,
-    in_progress: &mut HashSet<&'d str>,
-) -> Vec<Tok> {
-    // FIXME(eddyb) use `Cow` to optimize the case when no tokens are expanded.
-    let mut output_tokens = vec![];
-
-    let mut any_expansions = false;
-    let mut tokens = tokens.iter();
-    while let Some(tok) = tokens.next() {
-        if let Tok::Ident(name) = tok {
-            if let Some((&name, m)) = phase4.defines.get_key_value(&name[..]) {
-                if let Some(expanded_tokens) = m.expand(name, phase4, in_progress, &mut tokens) {
-                    output_tokens.extend(expanded_tokens);
-                    any_expansions = true;
-                    continue;
+        let mut any_expansions = false;
+        let mut tokens = tokens.iter();
+        while let Some(tok) = tokens.next() {
+            if let Tok::Ident(name) = tok {
+                if let Some((&name, m)) = self.defines.get_key_value(&name[..]) {
+                    if let Some(expanded_tokens) = m.expand(name, self, in_progress, &mut tokens) {
+                        output_tokens.extend(expanded_tokens);
+                        any_expansions = true;
+                        continue;
+                    }
                 }
             }
+
+            output_tokens.push(tok.clone());
         }
 
-        output_tokens.push(tok.clone());
-    }
-
-    // FIXME(eddyb) provide a way to control this, and/or optimize it.
-    let try_fixpoint = false;
-    if any_expansions && try_fixpoint {
-        // HACK(eddyb) this achieves fixpoint but is much more inefficient than it needs to be.
-        phase4.expand_macros(&output_tokens, in_progress)
-    } else {
-        output_tokens
+        // FIXME(eddyb) provide a way to control this, and/or optimize it.
+        let try_fixpoint = false;
+        if any_expansions && try_fixpoint {
+            // HACK(eddyb) this achieves fixpoint but is much more inefficient than it needs to be.
+            self.expand_macros(&output_tokens, in_progress)
+        } else {
+            output_tokens
+        }
     }
 }
 
@@ -484,88 +476,84 @@ impl SpecialCondMacro {
 
 impl Phase4<'_> {
     fn expand_macros_in_cond(&self, tokens: &[Tok]) -> Vec<Tok> {
-        expand_macros_in_cond(tokens, self)
-    }
-}
+        // FIXME(eddyb) use `Cow` to optimize the case when no tokens are expanded.
+        let mut output_tokens = vec![];
 
-fn expand_macros_in_cond(tokens: &[Tok], phase4: &Phase4) -> Vec<Tok> {
-    // FIXME(eddyb) use `Cow` to optimize the case when no tokens are expanded.
-    let mut output_tokens = vec![];
-
-    let mut tokens = tokens.iter();
-    while let Some(tok) = tokens.next() {
-        if let Tok::Ident(name) = tok {
-            if name == "defined" {
-                if let Some(arg_name) = tokens.try_eat(|tokens| {
-                    tokens.eat(&Tok::Whitespace);
-                    match tokens.next()? {
-                        Tok::Ident(name) => Some(name),
-                        Tok::Punct('(') => {
-                            tokens.eat(&Tok::Whitespace);
-                            if let Tok::Ident(name) = tokens.next()? {
+        let mut tokens = tokens.iter();
+        while let Some(tok) = tokens.next() {
+            if let Tok::Ident(name) = tok {
+                if name == "defined" {
+                    if let Some(arg_name) = tokens.try_eat(|tokens| {
+                        tokens.eat(&Tok::Whitespace);
+                        match tokens.next()? {
+                            Tok::Ident(name) => Some(name),
+                            Tok::Punct('(') => {
                                 tokens.eat(&Tok::Whitespace);
-                                if tokens.eat(&Tok::Punct(')')) {
-                                    return Some(name);
+                                if let Tok::Ident(name) = tokens.next()? {
+                                    tokens.eat(&Tok::Whitespace);
+                                    if tokens.eat(&Tok::Punct(')')) {
+                                        return Some(name);
+                                    }
                                 }
+                                None
                             }
-                            None
+                            _ => None,
                         }
-                        _ => None,
+                    }) {
+                        let is_defined = SpecialCondMacro::from_ident(arg_name).is_some()
+                            || self.defines.contains_key(&arg_name[..]);
+                        output_tokens.push(Tok::Literal((is_defined as u8).to_string()));
+                        continue;
                     }
-                }) {
-                    let is_defined = SpecialCondMacro::from_ident(arg_name).is_some()
-                        || phase4.defines.contains_key(&arg_name[..]);
-                    output_tokens.push(Tok::Literal((is_defined as u8).to_string()));
-                    continue;
                 }
-            }
 
-            if let Some(special @ SpecialCondMacro::HasInclude)
-            | Some(special @ SpecialCondMacro::HasIncludeNext) =
-                SpecialCondMacro::from_ident(&name)
-            {
-                if let Some((style, header_name)) = tokens.try_eat(|tokens| {
-                    tokens.eat(&Tok::Whitespace);
-                    if tokens.eat(&Tok::Punct('(')) {
-                        tokens.eat(&Tok::Whitespace);
-                        let header_name = parse_header_name(tokens)?;
-                        tokens.eat(&Tok::Whitespace);
-                        if tokens.eat(&Tok::Punct(')')) {
-                            return Some(header_name);
-                        }
-                    }
-                    None
-                }) {
-                    let start_after = if let SpecialCondMacro::HasIncludeNext = special {
-                        phase4.enclosing_header
-                    } else {
-                        None
-                    };
-                    let has_include = phase4.headers.has_include(
-                        style,
-                        phase4.enclosing_src_file,
-                        &header_name,
-                        start_after,
-                    );
-                    output_tokens.push(Tok::Literal((has_include as u8).to_string()));
-                    continue;
-                }
-            }
-
-            if let Some((&name, m)) = phase4.defines.get_key_value(&name[..]) {
-                if let Some(expanded_tokens) =
-                    m.expand(name, phase4, &mut HashSet::new(), &mut tokens)
+                if let Some(special @ SpecialCondMacro::HasInclude)
+                | Some(special @ SpecialCondMacro::HasIncludeNext) =
+                    SpecialCondMacro::from_ident(&name)
                 {
-                    output_tokens.extend(expanded_tokens);
-                    continue;
+                    if let Some((style, header_name)) = tokens.try_eat(|tokens| {
+                        tokens.eat(&Tok::Whitespace);
+                        if tokens.eat(&Tok::Punct('(')) {
+                            tokens.eat(&Tok::Whitespace);
+                            let header_name = parse_header_name(tokens)?;
+                            tokens.eat(&Tok::Whitespace);
+                            if tokens.eat(&Tok::Punct(')')) {
+                                return Some(header_name);
+                            }
+                        }
+                        None
+                    }) {
+                        let start_after = if let SpecialCondMacro::HasIncludeNext = special {
+                            self.enclosing_header
+                        } else {
+                            None
+                        };
+                        let has_include = self.headers.has_include(
+                            style,
+                            self.enclosing_src_file,
+                            &header_name,
+                            start_after,
+                        );
+                        output_tokens.push(Tok::Literal((has_include as u8).to_string()));
+                        continue;
+                    }
+                }
+
+                if let Some((&name, m)) = self.defines.get_key_value(&name[..]) {
+                    if let Some(expanded_tokens) =
+                        m.expand(name, self, &mut HashSet::new(), &mut tokens)
+                    {
+                        output_tokens.extend(expanded_tokens);
+                        continue;
+                    }
                 }
             }
+
+            output_tokens.push(tok.clone());
         }
 
-        output_tokens.push(tok.clone());
+        output_tokens
     }
-
-    output_tokens
 }
 
 struct CondEval<'a> {
@@ -786,79 +774,78 @@ impl<'a> Phase4<'a> {
     }
 
     fn expand_group(&mut self, group: &'a Group) -> Vec<Tok> {
-        expand_group(group, self)
-    }
-}
+        let mut output_tokens = vec![];
 
-fn expand_group<'a>(group: &'a Group, phase4: &mut Phase4<'a>) -> Vec<Tok> {
-    let mut output_tokens = vec![];
-
-    for part in &group.parts {
-        match part {
-            GroupPart::Verbatim(tokens) => {
-                output_tokens.extend(phase4.expand_macros(tokens, &mut HashSet::new()));
-            }
-            GroupPart::Directive { name, tokens } => {
-                if name == "include" || name == "include_next" && phase4.enclosing_header.is_some()
-                {
-                    let mut tokens = tokens.iter();
-                    if let Some((style, header_name)) = parse_header_name(&mut tokens) {
-                        if tokens.next().is_none() {
-                            let start_after = if name == "include_next" {
-                                phase4.enclosing_header
-                            } else {
-                                None
-                            };
-                            if let Some(header) = phase4.headers.include(
-                                style,
-                                phase4.enclosing_src_file,
-                                &header_name,
-                                start_after,
-                            ) {
-                                let mut header_phase4 = Phase4 {
-                                    enclosing_src_file: &header.src,
-                                    enclosing_header: Some(header),
-                                    headers: phase4.headers,
-                                    defines: mem::take(&mut phase4.defines),
+        for part in &group.parts {
+            match part {
+                GroupPart::Verbatim(tokens) => {
+                    output_tokens.extend(self.expand_macros(tokens, &mut HashSet::new()));
+                }
+                GroupPart::Directive { name, tokens } => {
+                    if name == "include"
+                        || name == "include_next" && self.enclosing_header.is_some()
+                    {
+                        let mut tokens = tokens.iter();
+                        if let Some((style, header_name)) = parse_header_name(&mut tokens) {
+                            if tokens.next().is_none() {
+                                let start_after = if name == "include_next" {
+                                    self.enclosing_header
+                                } else {
+                                    None
                                 };
-                                output_tokens.extend(header_phase4.expand());
-                                phase4.defines = header_phase4.defines;
-                                continue;
+                                if let Some(header) = self.headers.include(
+                                    style,
+                                    self.enclosing_src_file,
+                                    &header_name,
+                                    start_after,
+                                ) {
+                                    let mut header_phase4 = Phase4 {
+                                        enclosing_src_file: &header.src,
+                                        enclosing_header: Some(header),
+                                        headers: self.headers,
+                                        defines: mem::take(&mut self.defines),
+                                    };
+                                    output_tokens.extend(header_phase4.expand());
+                                    self.defines = header_phase4.defines;
+                                    continue;
+                                }
                             }
                         }
                     }
-                }
 
-                if name == "define" {
-                    let mut tokens = tokens.iter();
-                    if let Some(Tok::Ident(name)) = tokens.next() {
-                        phase4.defines.insert(name, Macro::parse(tokens));
-                        continue;
+                    if name == "define" {
+                        let mut tokens = tokens.iter();
+                        if let Some(Tok::Ident(name)) = tokens.next() {
+                            self.defines.insert(name, Macro::parse(tokens));
+                            continue;
+                        }
                     }
-                }
 
-                if name == "undef" {
-                    if let [Tok::Ident(name)] = &tokens[..] {
-                        phase4.defines.remove(&name[..]);
-                        continue;
+                    if name == "undef" {
+                        if let [Tok::Ident(name)] = &tokens[..] {
+                            self.defines.remove(&name[..]);
+                            continue;
+                        }
                     }
-                }
 
-                // HACK(eddyb) hide some (noop?) pragmas.
-                if name == "pragma" {
-                    if let [Tok::Ident(ns), Tok::Whitespace, Tok::Ident(pragma), rest @ ..] =
-                        &tokens[..]
-                    {
-                        if ns == "GCC" {
-                            if pragma == "system_header" && rest.is_empty() {
-                                continue;
-                            }
-                            if pragma == "diagnostic" {
-                                if let [Tok::Whitespace, Tok::Ident(action), rest @ ..] = rest {
-                                    if action == "ignored" {
-                                        if let [Tok::Whitespace, Tok::Literal(diagnostics)] = rest {
-                                            if diagnostics == "\"-Wliteral-suffix\"" {
-                                                continue;
+                    // HACK(eddyb) hide some (noop?) pragmas.
+                    if name == "pragma" {
+                        if let [Tok::Ident(ns), Tok::Whitespace, Tok::Ident(pragma), rest @ ..] =
+                            &tokens[..]
+                        {
+                            if ns == "GCC" {
+                                if pragma == "system_header" && rest.is_empty() {
+                                    continue;
+                                }
+                                if pragma == "diagnostic" {
+                                    if let [Tok::Whitespace, Tok::Ident(action), rest @ ..] = rest {
+                                        if action == "ignored" {
+                                            if let [Tok::Whitespace, Tok::Literal(diagnostics)] =
+                                                rest
+                                            {
+                                                if diagnostics == "\"-Wliteral-suffix\"" {
+                                                    continue;
+                                                }
                                             }
                                         }
                                     }
@@ -866,64 +853,62 @@ fn expand_group<'a>(group: &'a Group, phase4: &mut Phase4<'a>) -> Vec<Tok> {
                             }
                         }
                     }
-                }
 
-                // FIXME(eddyb) DRY this.
-                output_tokens.push(Tok::Punct('#'));
-                if !name.is_empty() {
-                    output_tokens.push(Tok::Ident(name.to_string()));
+                    // FIXME(eddyb) DRY this.
+                    output_tokens.push(Tok::Punct('#'));
+                    if !name.is_empty() {
+                        output_tokens.push(Tok::Ident(name.to_string()));
+                    }
+                    if !tokens.is_empty() {
+                        output_tokens.push(Tok::Whitespace);
+                    }
+                    output_tokens.extend(tokens.iter().cloned());
+                    output_tokens.push(Tok::Newline);
                 }
-                if !tokens.is_empty() {
-                    output_tokens.push(Tok::Whitespace);
+                GroupPart::IfElse { cond, then, else_ } => {
+                    let cond = self.expand_macros_in_cond(cond);
+                    let cond_eval = CondEval {
+                        tokens: cond.iter(),
+                    };
+                    let group = if cond_eval.eval() { then } else { else_ };
+                    output_tokens.extend(self.expand_group(group));
                 }
-                output_tokens.extend(tokens.iter().cloned());
-                output_tokens.push(Tok::Newline);
-            }
-            GroupPart::IfElse { cond, then, else_ } => {
-                let cond = phase4.expand_macros_in_cond(cond);
-                let cond_eval = CondEval {
-                    tokens: cond.iter(),
-                };
-                let group = if cond_eval.eval() { then } else { else_ };
-                output_tokens.extend(phase4.expand_group(group));
             }
         }
+        output_tokens
     }
-    output_tokens
-}
 
-impl Phase4<'_> {
     pub fn scan_for_includes(&self) -> Vec<String> {
-        scan_for_includes(&self.enclosing_src_file.phase3_group)
+        self.scan_group_for_includes(&self.enclosing_src_file.phase3_group)
     }
-}
 
-fn scan_for_includes(group: &Group) -> Vec<String> {
-    let mut includes = vec![];
+    fn scan_group_for_includes(&self, group: &Group) -> Vec<String> {
+        let mut includes = vec![];
 
-    for part in &group.parts {
-        match part {
-            GroupPart::Verbatim(_) => {}
-            GroupPart::Directive { name, tokens } => {
-                if name == "include" || name == "include_next" {
-                    let mut tokens = tokens.iter();
-                    if let Some((_, header_name)) = parse_header_name(&mut tokens) {
-                        if tokens.next().is_none() {
-                            includes.push(header_name);
+        for part in &group.parts {
+            match part {
+                GroupPart::Verbatim(_) => {}
+                GroupPart::Directive { name, tokens } => {
+                    if name == "include" || name == "include_next" {
+                        let mut tokens = tokens.iter();
+                        if let Some((_, header_name)) = parse_header_name(&mut tokens) {
+                            if tokens.next().is_none() {
+                                includes.push(header_name);
+                            }
                         }
                     }
                 }
-            }
-            GroupPart::IfElse {
-                cond: _,
-                then,
-                else_,
-            } => {
-                includes.extend(scan_for_includes(then));
-                includes.extend(scan_for_includes(else_));
+                GroupPart::IfElse {
+                    cond: _,
+                    then,
+                    else_,
+                } => {
+                    includes.extend(self.scan_group_for_includes(then));
+                    includes.extend(self.scan_group_for_includes(else_));
+                }
             }
         }
-    }
 
-    includes
+        includes
+    }
 }
